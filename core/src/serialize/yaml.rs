@@ -293,34 +293,57 @@ impl<'ast> Loader<'ast> {
             }
         }
 
-        // Parse a YAML scalar, inferring the type from the value itself.
-        fn parse<'a>(v: &str, alloc: &'a AstAlloc) -> Result<ast::Node<'a>, ParseError> {
-            if let Some(number) = v.strip_prefix("0x")
-                && let Ok(i) = i64::from_str_radix(number, 16)
-            {
-                return Ok(alloc.number(i.into()));
-            } else if let Some(number) = v.strip_prefix("0o")
-                && let Ok(i) = i64::from_str_radix(number, 8)
-            {
-                return Ok(alloc.number(i.into()));
-            } else if let Some(number) = v.strip_prefix('+')
-                && let Ok(i) = number.parse::<i64>()
-            {
-                return Ok(alloc.number(i.into()));
-            }
-            match v {
-                "~" | "null" | "Null" | "NULL" => Ok(ast::Node::Null),
-                "true" | "True" | "TRUE" => Ok(ast::Node::Bool(true)),
-                "false" | "False" | "FALSE" => Ok(ast::Node::Bool(false)),
-                _ => {
-                    if let Ok(i) = v.parse::<i64>() {
-                        Ok(alloc.number(i.into()))
-                    } else if let Some(f) = parse_float(v, alloc) {
-                        Ok(f)
-                    } else {
-                        Ok(alloc.string(v))
-                    }
+        // Parses an integer in one of the forms of the YAML 1.2 core schema: `[-+]?[0-9]+`,
+        // `0o[0-7]+` or `0x[0-9a-fA-F]+`. Integers that don't fit in an `i64` are fine, since
+        // Nickel numbers are arbitrary-precision.
+        fn parse_int(v: &str) -> Option<Number> {
+            use malachite::{Natural, base::num::conversion::traits::FromStringBase};
+
+            fn natural(digits: &str, radix: u8) -> Option<Natural> {
+                if !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix.into())) {
+                    Natural::from_string_base(radix, digits)
+                } else {
+                    None
                 }
+            }
+
+            if let Some(hex) = v.strip_prefix("0x") {
+                natural(hex, 16).map(Number::from)
+            } else if let Some(oct) = v.strip_prefix("0o") {
+                natural(oct, 8).map(Number::from)
+            } else if let Some(dec) = v.strip_prefix('-') {
+                natural(dec, 10).map(|n| -Number::from(n))
+            } else {
+                natural(v.strip_prefix('+').unwrap_or(v), 10).map(Number::from)
+            }
+        }
+
+        fn parse_bool(v: &str) -> Option<bool> {
+            match v {
+                "true" | "True" | "TRUE" => Some(true),
+                "false" | "False" | "FALSE" => Some(false),
+                _ => None,
+            }
+        }
+
+        // An empty plain scalar is also null in the core schema. Saphyr already turns untagged
+        // empty scalars into `~`, but not tagged ones such as `a: !!null`.
+        fn is_null(v: &str) -> bool {
+            matches!(v, "" | "~" | "null" | "Null" | "NULL")
+        }
+
+        // Parse a YAML scalar, inferring the type from the value itself.
+        fn parse<'a>(v: &str, alloc: &'a AstAlloc) -> ast::Node<'a> {
+            if is_null(v) {
+                ast::Node::Null
+            } else if let Some(b) = parse_bool(v) {
+                ast::Node::Bool(b)
+            } else if let Some(n) = parse_int(v) {
+                alloc.number(n)
+            } else if let Some(f) = parse_float(v, alloc) {
+                f
+            } else {
+                alloc.string(v)
             }
         }
 
@@ -331,19 +354,16 @@ impl<'ast> Loader<'ast> {
             && tag.is_yaml_core_schema()
         {
             let t = match tag.suffix.as_ref() {
-                "bool" => value
-                    .parse::<bool>()
+                "bool" => parse_bool(value)
                     .map(ast::Node::Bool)
-                    .map_err(|_| "invalid bool scalar"),
-                "int" => value
-                    .parse::<i64>()
-                    .map(|i| self.alloc.number(i.into()))
-                    .map_err(|_| "invalid int scalar"),
+                    .ok_or("invalid bool scalar"),
+                "int" => parse_int(value)
+                    .map(|n| self.alloc.number(n))
+                    .ok_or("invalid int scalar"),
                 "float" => parse_float(value, self.alloc).ok_or("invalid float scalar"),
-                "null" => match value {
-                    "~" | "null" => Ok(ast::Node::Null),
-                    _ => Err("invalid null scalar"),
-                },
+                "null" => is_null(value)
+                    .then_some(ast::Node::Null)
+                    .ok_or("invalid null scalar"),
                 "str" => Ok(ast::Node::String(self.alloc.alloc_str(value))),
                 _ => Err("unknown tag"),
             };
@@ -356,7 +376,7 @@ impl<'ast> Loader<'ast> {
             })?
         } else {
             // If there's no tag, try to infer the type.
-            parse(value, self.alloc)?
+            parse(value, self.alloc)
         };
 
         let node = Node::Scalar(Ast { node: t, pos });
@@ -841,5 +861,67 @@ foo: &ref
             &yaml_to_ncl(recursive_ref_with_name_collision),
             "let rec _anchor1 = [ 1, { _anchor0 = _anchor1 } ] in { foo = _anchor1 }"
         );
+    }
+
+    // Load a YAML array of numbers. The pretty-printer rounds large numbers, so this compares the
+    // exact values instead.
+    fn yaml_numbers(s: &str) -> Vec<Number> {
+        let alloc = AstAlloc::new();
+        let ast = load_yaml(&alloc, s, None, Listify::Auto).unwrap();
+        let ast::Node::Array(elts) = ast.node else {
+            panic!("expected an array, got {ast}");
+        };
+        elts.iter()
+            .map(|elt| match elt.node {
+                ast::Node::Number(n) => n.clone(),
+                _ => panic!("expected a number, got {elt}"),
+            })
+            .collect()
+    }
+
+    fn numbers(ns: &[&str]) -> Vec<Number> {
+        ns.iter().map(|n| n.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn untagged_ints() {
+        assert_eq!(&yaml_to_ncl("[0x1F, 0o17, +12, -0]"), "[ 31, 15, 12, 0 ]");
+        assert_eq!(
+            yaml_numbers("[0xFFFFFFFFFFFFFFFF, 0o7777777777777777777777]"),
+            numbers(&["18446744073709551615", "73786976294838206463"])
+        );
+        // A sign is only allowed in front of decimal integers, and only once.
+        assert_eq!(
+            &yaml_to_ncl("[0x-1, 0x+1, 0o-7, 0o+7, +-1, ++1]"),
+            r#"[ "0x-1", "0x+1", "0o-7", "0o+7", "+-1", "++1" ]"#
+        );
+    }
+
+    #[test]
+    fn core_schema_tags() {
+        assert_eq!(
+            yaml_numbers("[!!int 0x1F, !!int 0o17, !!int -3, !!int 99999999999999999999]"),
+            numbers(&["31", "15", "-3", "99999999999999999999"])
+        );
+        assert_eq!(
+            &yaml_to_ncl("[!!bool true, !!bool True, !!bool TRUE, !!bool False, !!bool FALSE]"),
+            "[ true, true, true, false, false ]"
+        );
+        assert_eq!(
+            &yaml_to_ncl("[!!null ~, !!null null, !!null Null, !!null NULL, !!null ]"),
+            "[ null, null, null, null, null ]"
+        );
+        assert_eq!(
+            &yaml_to_ncl("a: !!null\nb: !!str\n"),
+            r#"{ a = null, b = "" }"#
+        );
+
+        let alloc = AstAlloc::new();
+        for invalid in ["!!int 0x-1", "!!int 1.5", "!!bool yes", "!!null nil"] {
+            assert!(
+                load_yaml(&alloc, invalid, None, Listify::Auto).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
     }
 }
